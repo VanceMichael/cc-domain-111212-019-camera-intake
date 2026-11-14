@@ -4,6 +4,7 @@ from contextlib import AbstractContextManager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from threading import Lock, Thread
+import time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -43,12 +44,23 @@ class ReplaySource(AbstractContextManager):
                     self.send_header(name, str(value))
                 self.send_header('Content-Length', str(len(payload)))
                 self.end_headers()
-                width = max(1, response.get('chunk_bytes', len(payload) or 1))
+                sizes = response.get('chunk_sizes')
+                pause = response.get('chunk_pause', 0)
                 cutoff = response.get('disconnect_after', len(payload))
+                position = 0
+                index = 0
                 try:
-                    for position in range(0, min(cutoff, len(payload)), width):
+                    while position < min(cutoff, len(payload)):
+                        if sizes:
+                            width = max(1, sizes[index % len(sizes)])
+                        else:
+                            width = max(1, response.get('chunk_bytes', len(payload) or 1))
                         self.wfile.write(payload[position:min(position+width, cutoff)])
                         self.wfile.flush()
+                        position += width
+                        index += 1
+                        if pause and position < min(cutoff, len(payload)):
+                            time.sleep(pause)
                 except (BrokenPipeError, ConnectionResetError):
                     return
                 if cutoff < len(payload):

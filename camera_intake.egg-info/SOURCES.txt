@@ -1,0 +1,16 @@
+README.md
+app.py
+pyproject.toml
+sampledata.py
+scenario.py
+source.py
+storage.py
+stream.py
+transport.py
+camera_intake.egg-info/PKG-INFO
+camera_intake.egg-info/SOURCES.txt
+camera_intake.egg-info/dependency_links.txt
+camera_intake.egg-info/top_level.txt
+tests/test_scenario.py
+tests/test_source.py
+tests/test_stream.py

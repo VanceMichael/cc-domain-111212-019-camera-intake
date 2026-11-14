@@ -1,13 +1,18 @@
 import argparse
 import base64
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
+import time
 
+from scenario import live_routes
 from source import inspect_bytes
 from sampledata import samples
-from storage import Archive
+from storage import Archive, FrameStore
+from stream import IntakeSession
 from transport import ReplaySource, fetch
 
 MAX_INPUT = 16*1024*1024
@@ -35,6 +40,50 @@ def demo():
             return dict(input=name, bytes=len(raw), captures=len(archive.list()),
                         same_capture=first==repeated, rows=rows, requests=len(server.requests))
 
+def _phase_report(report, name, session, end_reason):
+    stats = session.stats()
+    stats['spool_dir_exists'] = os.path.isdir(stats.pop('spool_dir'))
+    stats['end_reason'] = end_reason
+    report['phases'][name] = stats
+
+def stream_demo():
+    """真实启动本地持续流源，演示分帧、采样、丢弃计数、断线重连与停采。"""
+    report = {'phases':{}}
+    with tempfile.TemporaryDirectory() as directory, ReplaySource(live_routes()) as server:
+        store = FrameStore(Path(directory)/'frames.sqlite3')
+        session = IntakeSession(server.url + '/live', 'cam-main', store,
+                                sample_interval=0.0, max_part_bytes=4096,
+                                spool_capacity=2, write_delay=0.2,
+                                idle_timeout=1.0, read_timeout=0.1,
+                                max_reconnects=3, retry_pause=0.6)
+        _phase_report(report, 'stream_and_slow_disk', session, session.run())
+        session = IntakeSession(server.url + '/live', 'cam-interval', store,
+                                sample_interval=3600.0, max_part_bytes=4096,
+                                spool_capacity=4, read_timeout=0.1,
+                                idle_timeout=1.0, max_reconnects=0)
+        _phase_report(report, 'interval_sampling', session, session.run())
+        session = IntakeSession(server.url + '/trickle', 'cam-silence', store,
+                                sample_interval=0.0, max_part_bytes=4096,
+                                spool_capacity=4, read_timeout=0.1,
+                                idle_timeout=0.4, max_reconnects=1, retry_pause=0.05)
+        _phase_report(report, 'source_silence', session, session.run())
+        stopping = IntakeSession(server.url + '/trickle', 'cam-stop', store,
+                                 sample_interval=0.0, max_part_bytes=4096,
+                                 spool_capacity=4, read_timeout=0.1,
+                                 idle_timeout=30.0, max_reconnects=0)
+        worker = threading.Thread(target=stopping.run)
+        worker.start()
+        time.sleep(0.5)
+        stopping.stop()
+        worker.join(timeout=5)
+        _phase_report(report, 'manual_stop', stopping, 'stop_requested')
+        report['phases']['manual_stop']['stopped_promptly'] = not worker.is_alive()
+        report['frames'] = store.list_frames()
+        report['gaps'] = store.list_gaps()
+        report['requests'] = len(server.requests)
+        store.close()
+    return report
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='来源检查与原件留存')
     commands = parser.add_subparsers(dest='command', required=True)
@@ -49,10 +98,45 @@ def main(argv=None):
     fixtures = commands.add_parser('fixtures')
     fixtures.add_argument('directory')
     commands.add_parser('demo')
+    stream = commands.add_parser('stream')
+    stream.add_argument('url')
+    stream.add_argument('--database', required=True)
+    stream.add_argument('--source', required=True)
+    stream.add_argument('--interval', type=float, default=1.0)
+    stream.add_argument('--max-part-bytes', type=int, default=262144)
+    stream.add_argument('--spool-capacity', type=int, default=8)
+    stream.add_argument('--max-seconds', type=float, default=None)
+    stream.add_argument('--reconnects', type=int, default=2)
+    for name in ('frames', 'gaps'):
+        command = commands.add_parser(name)
+        command.add_argument('--database', required=True)
+    commands.add_parser('stream-demo')
     args = parser.parse_args(argv)
     try:
         if args.command == 'demo':
             result = demo()
+        elif args.command == 'stream-demo':
+            result = stream_demo()
+        elif args.command == 'stream':
+            with FrameStore(args.database) as store:
+                session = IntakeSession(args.url, args.source, store,
+                                        sample_interval=args.interval,
+                                        max_part_bytes=args.max_part_bytes,
+                                        spool_capacity=args.spool_capacity,
+                                        run_seconds=args.max_seconds,
+                                        max_reconnects=args.reconnects)
+                try:
+                    end_reason = session.run()
+                except KeyboardInterrupt:
+                    session.stop()
+                    end_reason = 'interrupted'
+                result = dict(end_reason=end_reason, stats=session.stats())
+        elif args.command == 'frames':
+            with FrameStore(args.database) as store:
+                result = store.list_frames()
+        elif args.command == 'gaps':
+            with FrameStore(args.database) as store:
+                result = store.list_gaps()
         elif args.command == 'fixtures':
             destination = Path(args.directory)
             destination.mkdir(parents=True, exist_ok=True)
